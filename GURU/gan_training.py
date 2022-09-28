@@ -586,6 +586,242 @@ def train_gan_all(netG, netD, gan_loader, opt_d, opt_g, device, param, iteration
             plot.flush(param.result_path + "/gan_loss")
         plot.tick()
 
+def train_gan_ssl(netG, gan_loader, opt_g, device, param, iterations,
+                  train_overlap, rec_loaders, test_loaders, domain="a", overlap=True):
+    if torch.cuda.device_count() > 1:
+        l2_func = nn.DataParallel(l2_constraint())
+    else:
+        l2_func = l2_constraint()
+    opt_final_rec = optim.Adam(netG.parameters(), lr=0.001, betas=(0.9, 0.98))
+
+    k_val = [5, 10, 20]
+    result = [{}, {}]
+    for val in k_val:
+        result[0][str(val)] = {"ht_eval": [], "ndcg_eval": [], "mrr_eval": [],
+                               "ht_test": [], "ndcg_test": [], "mrr_test": []}
+        result[1][str(val)] = {"ht_eval": [], "ndcg_eval": [], "mrr_eval": [],
+                               "ht_test": [], "ndcg_test": [], "mrr_test": []}
+    metrics_name = list(result[0]["5"].keys())
+    FIXED_GENERATOR = False  # whether to hold the generator fixed at real data plus
+    a_iterator = iter(gan_loader[0])
+    b_iterator = iter(gan_loader[1])
+
+    overlap_iter = iter(train_overlap)
+    dataloader_iterator = iter(rec_loaders[0])
+
+    if domain == "a":
+        rec_iterator = iter(gan_loader[0])
+    else:
+        rec_iterator = iter(gan_loader[1])
+    for iteration in tqdm(range(int(iterations * 1.2))):
+        # gan training of the NetD and GUR encoder *** phase 2 ***
+        if iteration < int(iterations * 0.6):  # or iteration % 2 == 0:
+            ############################
+            # (1) Update D network
+            ###########################
+            for p in netD.parameters():   # reset requires_grad
+                p.requires_grad = True    # they are set to False below in netG update
+
+            for iter_d in range(CRITIC_ITERS):
+                # a domain data
+                try:
+                    in_seq_a, _, _, _, _, _, _, _ = get_next_batch(a_iterator, device)
+                except StopIteration:
+                    if iteration > 1000:
+                        a_iterator = iter(gan_loader[0])  # freq
+                    else:
+                        a_iterator = iter(gan_loader[0])  # random
+                    in_seq_a, _, _, _, _, _, _, _ = get_next_batch(a_iterator, device)
+                mask_a = in_seq_a == param.pad_index
+                mask_a = (1 - mask_a.to(int)).view(-1).to(torch.float32).to(device)
+                in_seq_a = in_seq_a.to(device)
+                if torch.cuda.device_count() > 1:
+                    in_seq_ae = netG.module.get_seq_embed(in_seq_a, domain="a",
+                                                          mask=mask_a.view(-1, param.rec_maxlen))[:, -1, :]
+                else:
+                    in_seq_ae = netG.get_seq_embed(in_seq_a, domain="a",
+                                                   mask=mask_a.view(-1, param.rec_maxlen))[:, -1, :]
+                in_seq_ae = in_seq_ae.detach()  # detach when training,
+                # b domain data
+                try:
+                    in_seq_b, _, _, _, _, _, _, _ = get_next_batch(b_iterator, device)
+                except StopIteration:
+                    if iteration > 1000:
+                        b_iterator = iter(gan_loader[1])
+                    else:
+                        b_iterator = iter(gan_loader[1])
+                    in_seq_b, _, _, _, _, _, _, _ = get_next_batch(b_iterator, device)
+                mask_b = in_seq_b == param.pad_index
+                mask_b = (1 - mask_b.to(int)).view(-1).to(torch.float32).to(device)
+                in_seq_b = in_seq_b.to(device)
+                if torch.cuda.device_count() > 1:
+                    in_seq_be = netG.module.get_seq_embed(in_seq_b, domain="b",
+                                                          mask=mask_b.view(-1, param.rec_maxlen))[:, -1, :]
+                else:
+                    in_seq_be = netG.get_seq_embed(in_seq_b, domain="b",
+                                                   mask=mask_b.view(-1, param.rec_maxlen))[:, -1, :]
+                in_seq_be = in_seq_be.detach()
+
+                # go through discriminator.
+                opt_d.zero_grad()
+                D_real = netD(in_seq_ae)  # output of dis is a logits. (scalar)
+                D_fake = netD(in_seq_be)
+                # loss 1
+                real_loss = D_real.mean()
+                fake_loss = D_fake.mean()
+                dis_loss = fake_loss - real_loss
+                # loss 2
+                # fake_loss, real_loss = loss_ce(D_fake, zero_label), loss_ce(D_real, one_label)
+                # dis_loss = fake_loss + real_loss
+
+                dis_loss.backward()
+                # train with gradient penalty  in_seq_ae.data
+                gradient_penalty = calc_gradient_penalty(netD, in_seq_ae, in_seq_be, param.batch_size, device)
+                gradient_penalty.backward()
+
+                D_cost = fake_loss - real_loss + gradient_penalty  # loss_1
+                # D_cost = fake_loss + real_loss + gradient_penalty
+                Wasserstein_D = D_real.mean() - D_fake.mean()
+                opt_d.step()
+
+            if not FIXED_GENERATOR:
+                ############################
+                # (2) Update G network
+                ###########################
+                for p in netD.parameters():
+                    p.requires_grad = False  # to avoid update discriminator
+                opt_g.zero_grad()
+
+                # ===================================================== discriminator loss
+                # a-domain data
+                try:
+                    in_seq_a, dec_in_a, dec_out_a, n_items_a, _, _, bs, sl = get_next_batch(a_iterator, device)
+                except StopIteration:
+                    if iteration > 1000:
+                        a_iterator = iter(gan_loader[0])  # freq a-domain data
+                    else:
+                        a_iterator = iter(gan_loader[0])  # rand a-domain data
+                    in_seq_a, dec_in_a, dec_out_a, n_items_a, _, _, bs, sl = get_next_batch(a_iterator, device)
+                    #  bs, sl are the same in different domain.
+                in_seq_ae = get_user_embed(netG, in_seq_a, "a", param, device, 0)
+                # b domain data
+                try:
+                    in_seq_b, dec_in_b, dec_out_b, n_items_b, _, _, bs, sl = get_next_batch(b_iterator, device)
+                except StopIteration:
+                    if iteration > 1000:
+                        b_iterator = iter(gan_loader[1])  # freq b-domain
+                    else:
+                        b_iterator = iter(gan_loader[1])  # random b-domain
+                    in_seq_b, dec_in_b, dec_out_b, n_items_b, _, _, bs, sl = get_next_batch(b_iterator, device)
+                in_seq_be = get_user_embed(netG, in_seq_b, "b", param, device, 0)
+
+                D_real = netD(in_seq_ae)  # output of dis is a logits. (scalar)
+                D_fake = netD(in_seq_be)
+                # loss 1
+                real_loss = D_real.mean()
+                fake_loss = D_fake.mean()
+                g_dis_loss = real_loss - fake_loss
+                # loss 2
+                # fake_loss, real_loss = loss_ce(D_fake, one_label), loss_ce(D_real, zero_label)
+                # g_dis_loss = fake_loss + real_loss
+                g_dis_loss.backward()
+
+                # ===================================================== l2 loss on overlap data loader
+                if overlap:
+                    try:
+                        overlap_a, overlap_b = next(overlap_iter)
+                    except StopIteration:
+                        overlap_iter = iter(train_overlap)
+                        overlap_a, overlap_b = next(overlap_iter)
+                    over_seq_ae = get_user_embed(netG, overlap_a[0].to(device), "a", param, device, 0)
+                    over_seq_be = get_user_embed(netG, overlap_b[0].to(device), "b", param, device, 0)
+                    # overlap_loss = l2_loss(over_seq_ae, over_seq_be)
+                    if torch.cuda.device_count() > 1:
+                        overlap_loss = l2_func.module.forward_2(over_seq_ae, over_seq_be)
+                    else:
+                        overlap_loss = l2_func.forward_2(over_seq_ae, over_seq_be)
+                    overlap_loss.backward()
+                # ======== reconstruction loss
+                mask_rec_a = get_pad_mask(dec_out_a, param.pad_index, device)
+                loss_recon_a = loss_ae(netG, in_seq_a, dec_in_a, dec_out_a, n_items_a, True, bs, sl,
+                                       param, mask_rec_a, device, domain="a")
+
+                mask_rec_b = get_pad_mask(dec_out_b, param.pad_index, device)
+                loss_recon_b = loss_ae(netG, in_seq_b, dec_in_b, dec_out_b, n_items_b, True, bs, sl,
+                                       param, mask_rec_b, device, domain="b")
+
+                loss_recon_a.backward()
+                loss_recon_b.backward()
+
+                # ===================================================== Recommendation loss on target domain
+                # None.
+                # back-propagation
+                opt_g.step()
+            plot.plot(param.result_path + '/disc cost_%s' % date, D_cost.cpu().data.numpy())
+            plot.plot(param.result_path + '/wasserstein distance_%s' % date, Wasserstein_D.cpu().data.numpy())
+            plot.plot(param.result_path + '/join_recon_a%s' % date, loss_recon_a.cpu().data.numpy())
+            plot.plot(param.result_path + '/join_recon_b%s' % date, loss_recon_b.cpu().data.numpy())
+            plot.plot(param.result_path + '/gen cost_%s' % date, g_dis_loss.cpu().data.numpy())
+        else:  # tune with recommendation task in target domain. *** phase 3 ***
+            opt_final_rec.zero_grad()
+            try:
+                enc_in, dec_in, dec_out, n_items, _, _, bs, sl = get_next_batch(dataloader_iterator, device)
+            except StopIteration:
+                if iteration > int(iterations * 0.8):  # freq
+                    dataloader_iterator = iter(rec_loaders[1])
+                else:  # random
+                    dataloader_iterator = iter(rec_loaders[0])
+
+                enc_in, dec_in, dec_out, n_items, _, _, bs, sl = get_next_batch(dataloader_iterator, device)
+            try:
+                in_seq_rec, dec_in_rec, dec_out_rec, n_items_rec, _, _, bs, sl = get_next_batch(rec_iterator,
+                                                                                                device)
+            except StopIteration:
+                if domain == "a":
+                    rec_iterator = iter(gan_loader[0])  # rand a-domain data
+                else:
+                    rec_iterator = iter(gan_loader[1])  # rand a-domain data
+                in_seq_rec, dec_in_rec, dec_out_rec, n_items_rec, _, _, bs, sl = get_next_batch(rec_iterator,
+                                                                                                device)
+            # rec
+            mask_rec = get_pad_mask(dec_out_rec, param.pad_index, device)
+            loss_recon_rec = loss_ae(netG, in_seq_rec, dec_in_rec, dec_out_rec, n_items_rec, True, bs, sl,
+                                     param, mask_rec, device, domain=domain)
+            loss_recon_rec.backward()
+
+            # mask
+            mask = dec_out == param.pad_index
+            mask = (1 - mask.to(int)).view(-1).to(torch.float32)  # 0, 1
+            mask.to(device)
+            loss_recommend = loss_bpr_func(netG, enc_in, dec_in, dec_out, n_items, mask, domain, param)
+            # back propagation
+            loss_recommend.backward()
+            # back propagation: 1:1:1:1 for discriminator, l2, reconstruction and recommendation loss
+            opt_final_rec.step()
+            # opt_g.step()
+
+            plot.plot(param.result_path + '/tuning_recommendation_loss', loss_recommend.cpu().data.numpy())
+
+        # Write logs and save samples
+        if iteration > int(iterations * 0.8) and iteration % 30 == 29:
+            netG.eval()
+            result_tmp = evaluation_2(netG, test_loaders, device, param,
+                                      sas=False, domain=domain)
+            for key in k_val:
+                key = str(key)
+                for metric in metrics_name:
+                    result[0][key][metric].extend(result_tmp[0][key][metric])
+                    result[1][key][metric].extend(result_tmp[1][key][metric])
+            Dataloader.save_pickle(result, param.result_path + "/result_%s.pickle" % param.target_domain)
+            netG.train()
+        # if not FIXED_GENERATOR:
+        #     plot.plot(param.result_path + '/gen cost_%s' % date, g_dis_loss.cpu().data.numpy())
+        if iteration % 100 == 99:
+            if not os.path.isdir(param.result_path + "/gan_loss"):
+                os.mkdir(param.result_path + "/gan_loss")
+            plot.flush(param.result_path + "/gan_loss")
+        plot.tick()
+
 
 def train_gan_all_2(netG, netD, gan_loader, opt_d, opt_g, device, param, iters,
                     train_overlap, rec_loaders, test_loaders, domain="a", devices=None):
@@ -969,32 +1205,6 @@ def recommendation_tune(model, rec_loader, test_loader, steps, param, device, do
             plot.tick()
 
 
-# def main(auto_cross, opt_rec, netD, opt_gen, opt_dis, param, device_t,
-#          ae_loaders, rec_loaders, test_loaders, train_overlap):
-#     # param, device_t, train_loader_ae, train_loader_re, eval_loader, item_freq = None, shared = True
-#     print("============ Reconstruction pre-training.")
-#     train_recon_x(auto_cross, opt_rec, param.n_warmup_steps, ae_loaders, param, device_t,
-#                   neg_sample=True, loss_type="s_soft", opt_type="schedule")
-#     # train_gan(auto_cross, netD, rec_loaders, test_loaders, opt_dis, opt_gen, device_t, param, 5000)
-#     print("============ Adversarial training.")
-#     train_gan(auto_cross, netD, ae_loaders, opt_dis, opt_gen, device_t, param, param.n_warmup_steps, train_overlap)
-#
-#     # save checkpoint here,
-#     torch.save(auto_cross.state_dict(), param.model_path + "/pre_model")
-#     # fine-tune on recommendation task. a domain and b domain separately.
-#     # tune in domain "a"
-#     print("============ Fine-tune in domain a.")
-#     recommendation_tune(auto_cross, [rec_loaders[0][0], rec_loaders[1][0]],
-#                         test_loaders[0], param.training_steps_tune,
-#                         param, device_t, domain="a")
-#     # tune in domain "b
-#     print("============ Fine-tune in domain b.")
-#     auto_cross.load_state_dict(torch.load(param.model_path + "/pre_model"))
-#     recommendation_tune(auto_cross, [rec_loaders[0][1], rec_loaders[1][1]], test_loaders[1],
-#                         param.training_steps_tune,
-#                         param, device_t, domain="b")
-
-
 def main_2(auto_cross, opt_rec, netD, opt_gen, opt_dis, param, device_t,
            ae_loaders, rec_loaders, test_loaders, train_overlap):
     print("============ Reconstruction pre-training (Phase 1).")
@@ -1010,18 +1220,16 @@ def main_2(auto_cross, opt_rec, netD, opt_gen, opt_dis, param, device_t,
                   rec_loaders, test_loaders, domain=param.target_domain, overlap=False)
 
 
-# def main_3(auto_cross, opt_rec, netD, opt_gen, opt_dis, param, device_t,
-#            ae_loaders, rec_loaders, test_loaders, train_overlap, devices):
-#     print("============ Reconstruction pre-training.")
-#     # if os.path.isfile(param.model_path + "/pre_model"):
-#     #     print("restore pre-trained model")
-#     #     auto_cross.module.load_state_dict(torch.load(param.model_path + "/pre_model"))
-#     # else:
-#     train_recon_x(auto_cross, opt_rec, 2000, ae_loaders, param, device_t,
-#                   neg_sample=True, loss_type="s_soft", opt_type="schedule")
-#     torch.save(auto_cross.module.state_dict(), param.model_path + "/pre_model")
-#     print("============ Adversarial and recommendation training.")
-#     train_gan_all_2(auto_cross, netD, ae_loaders, opt_dis, opt_gen,
-#                     device_t, param, param.training_steps_tune, train_overlap,
-#                     rec_loaders, test_loaders, domain=param.target_domain,
-#                     devices=devices)
+def main_ssl(auto_cross, opt_rec, opt_gen, param, device_t,
+           ae_loaders, rec_loaders, test_loaders, train_overlap):
+    print("============ Reconstruction pre-training (Phase 1).")
+    train_recon_x(auto_cross, opt_rec, 200, ae_loaders, param, device_t,
+                  neg_sample=True, loss_type="s_soft", opt_type="schedule")  # 5k
+    if torch.cuda.device_count() > 1:
+        torch.save(auto_cross.module.state_dict(), param.model_path + "/pre_model")
+    else:
+        torch.save(auto_cross.state_dict(), param.model_path + "/pre_model")
+    print("============ Adversarial and recommendation training (phase 2 and phase 3).")
+    train_gan_ssl(auto_cross, ae_loaders, opt_gen,
+                  device_t, param, param.training_steps_tune, train_overlap,
+                  rec_loaders, test_loaders, domain=param.target_domain, overlap=False)

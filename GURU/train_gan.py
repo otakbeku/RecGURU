@@ -136,7 +136,10 @@ if __name__ == "__main__":
     # gt.train_gan(enc_model, netD, train_loader_a, train_loader_b, opt_enc, optimizerD, device, param.batch_size, 5000)
 
     # gt.main(enc_model, opt_rec, netD, opt_gen, opt_dis, param, device, loaders)
-    gt.main_2(enc_model, opt_rec, netD, opt_gen, opt_dis, param, device,
+
+    # gt.main_2(enc_model, opt_rec, netD, opt_gen, opt_dis, param, device,
+    #           ae_loaders, rec_loaders, test_loaders, train_overlap)
+    # SSL part
+    gt.main_ssl(enc_model, opt_rec, netD, opt_gen, opt_dis, param, device,
               ae_loaders, rec_loaders, test_loaders, train_overlap)
-    # gt.main_3(enc_model, opt_rec, netD, opt_gen, opt_dis, param, device,
-    #           ae_loaders, rec_loaders, test_loaders, train_overlap, devices)
+    
